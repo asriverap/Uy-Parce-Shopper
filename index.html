@@ -3181,17 +3181,33 @@ const TARIFAS_ENVIO = {
   prime800: { label: 'Prime 800', usdLb: 5 }
 };
 const SEGURO_ENVIO_USD = 10; // seguro obligatorio, por cada caja enviada
+// Recargo por trayecto especial (pocas cajas): opcional, $10 es el mínimo y el valor por defecto, pero se
+// puede subir para trayectos más largos. Se guarda en la caja como trayectoEspecialUsd (0 = sin recargo).
+const TRAYECTO_ESPECIAL_MIN_USD = 10;
 let ENVIOS_COBRO_PENDIENTE = [];
-function calcularValorEnvio(pesoLb, tipoEnvio){
+function calcularValorEnvio(pesoLb, tipoEnvio, trayectoUsd){
   const tarifa = TARIFAS_ENVIO[tipoEnvio];
   const peso = Number(pesoLb);
   if(!tarifa || !(peso > 0)) return null;
+  const trayecto = Math.round((Number(trayectoUsd) || 0) * 100) / 100;
   const flete = Math.round(peso * tarifa.usdLb * 100) / 100;
-  return { peso, tarifaLb: tarifa.usdLb, flete, seguro: SEGURO_ENVIO_USD, total: Math.round((flete + SEGURO_ENVIO_USD) * 100) / 100 };
+  return { peso, tarifaLb: tarifa.usdLb, flete, seguro: SEGURO_ENVIO_USD, trayecto, total: Math.round((flete + SEGURO_ENVIO_USD + trayecto) * 100) / 100 };
 }
-function envioCalculoHtml(calc){
+// Recargo de trayecto especial según el borrador: 0 si no está activado; NaN si está activado pero el
+// valor escrito no es válido (vacío o menor al mínimo) — así el cálculo y el guardado lo detectan.
+function trayectoDelDraft(d){
+  if(!d.trayecto) return 0;
+  const v = Number(d.trayectoValor);
+  return (d.trayectoValor !== '' && v >= TRAYECTO_ESPECIAL_MIN_USD) ? v : NaN;
+}
+function envioCalculoHtml(calc, trayectoInvalido){
+  if(trayectoInvalido) return `<span style="color:var(--danger);">El trayecto especial debe ser de mínimo ${fmtUSD(TRAYECTO_ESPECIAL_MIN_USD)}.</span>`;
   if(!calc) return 'Ingresa el peso y elige el tipo de envío para calcular el valor.';
-  return `${calc.peso} lb × ${fmtUSD(calc.tarifaLb)}/lb = ${fmtUSD(calc.flete)} + seguro ${fmtUSD(calc.seguro)} = <strong style="font-size:15px; color:var(--ink);">${fmtUSD(calc.total)}</strong>`;
+  return `${calc.peso} lb × ${fmtUSD(calc.tarifaLb)}/lb = ${fmtUSD(calc.flete)} + seguro ${fmtUSD(calc.seguro)}${calc.trayecto ? ` + trayecto especial ${fmtUSD(calc.trayecto)}` : ''} = <strong style="font-size:15px; color:var(--ink);">${fmtUSD(calc.total)}</strong>`;
+}
+function envioCalculoDraftHtml(d){
+  const trayecto = trayectoDelDraft(d);
+  return envioCalculoHtml(calcularValorEnvio(d.peso, d.tipo, trayecto), Number.isNaN(trayecto));
 }
 // Si la caja no tiene cliente asignado pero todas sus prendas son de un mismo cliente, se sugiere ese.
 function clienteSugeridoCaja(caja){
@@ -3208,7 +3224,9 @@ function obtenerEnvioCobroDraft(caja){
     envioCobroDrafts[caja.codigo] = {
       peso: caja.pesoLb != null ? String(caja.pesoLb) : '',
       tipo: caja.tipoEnvio || '',
-      cliente: clienteSugeridoCaja(caja)
+      cliente: clienteSugeridoCaja(caja),
+      trayecto: (caja.trayectoEspecialUsd || 0) > 0,
+      trayectoValor: (caja.trayectoEspecialUsd || 0) > 0 ? String(caja.trayectoEspecialUsd) : String(TRAYECTO_ESPECIAL_MIN_USD)
     };
   }
   const d = envioCobroDrafts[caja.codigo];
@@ -3235,28 +3253,50 @@ function envioCobroFormHtml(caja, pref){
         <input id="${pref}-cliente" list="${pref}-clientes-dl" value="${esc(d.cliente)}" placeholder="Escribe o elige el cliente" autocomplete="off">
         <datalist id="${pref}-clientes-dl">${mayoristas.map(c => `<option value="${esc(c.nombre)}"></option>`).join('')}</datalist>
       </div>
+      <div class="full" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <label class="toggle-switch" style="margin:0;"><input type="checkbox" id="${pref}-trayecto" ${d.trayecto ? 'checked' : ''}><span class="toggle-slider"></span></label>
+        <label for="${pref}-trayecto" style="margin:0; cursor:pointer; text-transform:none; letter-spacing:0; font-size:13.5px; color:var(--ink);">Trayecto especial</label>
+        <span id="${pref}-trayecto-wrap" style="display:${d.trayecto ? 'inline-flex' : 'none'}; align-items:center; gap:6px;">
+          <span style="font-size:13px; color:var(--ink-soft);">+ USD</span>
+          <input id="${pref}-trayecto-valor" type="number" min="${TRAYECTO_ESPECIAL_MIN_USD}" step="0.01" inputmode="decimal" value="${esc(d.trayectoValor)}" style="width:110px;" autocomplete="off">
+          <span style="font-size:11.5px; color:var(--ink-soft);">(mínimo ${fmtUSD(TRAYECTO_ESPECIAL_MIN_USD)})</span>
+        </span>
+      </div>
     </div>
-    <p class="hint" id="${pref}-calc" style="margin-top:8px;">${envioCalculoHtml(calcularValorEnvio(d.peso, d.tipo))}</p>
+    <p class="hint" id="${pref}-calc" style="margin-top:8px;">${envioCalculoDraftHtml(d)}</p>
   `;
 }
 function enlazarEnvioCobroForm(caja, pref){
   const d = obtenerEnvioCobroDraft(caja);
   const refrescarCalculo = ()=>{
     const box = document.getElementById(pref + '-calc');
-    if(box) box.innerHTML = envioCalculoHtml(calcularValorEnvio(d.peso, d.tipo));
+    if(box) box.innerHTML = envioCalculoDraftHtml(d);
   };
+  document.getElementById(pref + '-trayecto')?.addEventListener('change', e=>{
+    d.trayecto = e.target.checked;
+    // Cada vez que se activa arranca en el mínimo si el valor quedó vacío o inválido.
+    if(d.trayecto && !(Number(d.trayectoValor) >= TRAYECTO_ESPECIAL_MIN_USD)) d.trayectoValor = String(TRAYECTO_ESPECIAL_MIN_USD);
+    const wrap = document.getElementById(pref + '-trayecto-wrap');
+    if(wrap) wrap.style.display = d.trayecto ? 'inline-flex' : 'none';
+    const valor = document.getElementById(pref + '-trayecto-valor');
+    if(valor) valor.value = d.trayectoValor;
+    refrescarCalculo();
+  });
+  document.getElementById(pref + '-trayecto-valor')?.addEventListener('input', e=>{ d.trayectoValor = e.target.value; refrescarCalculo(); });
   document.getElementById(pref + '-peso')?.addEventListener('input', e=>{ d.peso = e.target.value; refrescarCalculo(); });
   document.getElementById(pref + '-tipo')?.addEventListener('change', e=>{ d.tipo = e.target.value; refrescarCalculo(); });
   document.getElementById(pref + '-cliente')?.addEventListener('input', e=>{ d.cliente = e.target.value; d.clienteTocado = true; });
 }
 // Valida el borrador y devuelve los campos a guardar en la caja, o null (tras avisar) si falta algo.
 function construirCobroEnvio(d){
-  const calc = calcularValorEnvio(d.peso, d.tipo);
+  const trayecto = trayectoDelDraft(d);
+  if(Number.isNaN(trayecto)){ alert(`El trayecto especial debe ser de mínimo ${fmtUSD(TRAYECTO_ESPECIAL_MIN_USD)}. Corrige el valor o desactiva "Trayecto especial".`); return null; }
+  const calc = calcularValorEnvio(d.peso, d.tipo, trayecto);
   const cliente = (d.cliente||'').trim();
   if(!calc){ alert('Para el cobro del envío, ingresa un peso mayor a 0 y elige el tipo de envío.'); return null; }
   if(!cliente){ alert('Indica a qué cliente mayorista se le cobra este envío.'); return null; }
   return {
-    pesoLb: calc.peso, tipoEnvio: d.tipo, tarifaLb: calc.tarifaLb, seguroEnvio: calc.seguro, valorEnvio: calc.total,
+    pesoLb: calc.peso, tipoEnvio: d.tipo, tarifaLb: calc.tarifaLb, seguroEnvio: calc.seguro, trayectoEspecialUsd: calc.trayecto, valorEnvio: calc.total,
     cliente, envioPagado: false, envioPendiente: true,
     fechaValorEnvio: new Date().toISOString(),
     valorEnvioPor: currentUserData ? currentUserData.nombre : 'desconocido'
@@ -3328,7 +3368,7 @@ function envioCobroRepoHtml(caja){
     const tarifa = TARIFAS_ENVIO[caja.tipoEnvio];
     return `
       <div class="code-display no-print" style="flex-direction:column; align-items:flex-start; gap:6px; margin-bottom:12px; font-family:var(--sans); font-size:13px; white-space:normal; overflow-wrap:anywhere; ${caja.envioPagado ? 'border-color:var(--success); background:var(--success-bg);' : ''}">
-        <div>🚚 <strong>Cobro de envío:</strong> ${caja.pesoLb} lb · ${tarifa ? tarifa.label : esc(caja.tipoEnvio||'')} (${fmtUSD(caja.tarifaLb)}/lb) · flete ${fmtUSD(Math.round((caja.valorEnvio - (caja.seguroEnvio||0))*100)/100)} + seguro ${fmtUSD(caja.seguroEnvio||0)} = <strong>${fmtUSD(caja.valorEnvio)}</strong></div>
+        <div>🚚 <strong>Cobro de envío:</strong> ${caja.pesoLb} lb · ${tarifa ? tarifa.label : esc(caja.tipoEnvio||'')} (${fmtUSD(caja.tarifaLb)}/lb) · flete ${fmtUSD(Math.round((caja.valorEnvio - (caja.seguroEnvio||0) - (caja.trayectoEspecialUsd||0))*100)/100)} + seguro ${fmtUSD(caja.seguroEnvio||0)}${caja.trayectoEspecialUsd ? ` + trayecto especial ${fmtUSD(caja.trayectoEspecialUsd)}` : ''} = <strong>${fmtUSD(caja.valorEnvio)}</strong></div>
         <div>Cliente: <strong>${esc(caja.cliente||'—')}</strong> · ${caja.envioPagado
           ? `<span style="color:var(--success); font-weight:700;">✅ Pagado${caja.fechaPagoEnvio ? ' el ' + fmtFechaCorta(caja.fechaPagoEnvio) : ''}</span>`
           : `<span style="color:var(--danger); font-weight:700;">Pendiente de pago</span>`}</div>
@@ -3480,7 +3520,7 @@ async function sellarCaja(codigo){
       return;
     }
   }
-  const resumenCobro = cobro ? `\n\nEnvío ${TARIFAS_ENVIO[cobro.tipoEnvio].label}: ${cobro.pesoLb} lb = ${fmtUSD(cobro.valorEnvio)} (seguro incluido), a cargo de ${cobro.cliente}.` : '';
+  const resumenCobro = cobro ? `\n\nEnvío ${TARIFAS_ENVIO[cobro.tipoEnvio].label}: ${cobro.pesoLb} lb = ${fmtUSD(cobro.valorEnvio)} (seguro${cobro.trayectoEspecialUsd ? ` y trayecto especial de ${fmtUSD(cobro.trayectoEspecialUsd)}` : ''} incluido), a cargo de ${cobro.cliente}.` : '';
   if(!confirm(`¿Sellar y enviar la caja ${codigo} con ${caja.itemIds.length} prenda(s)? Ya no se le podrán agregar más productos.${resumenCobro}`)) return;
   const fechaEnviado = new Date().toISOString();
   try{
@@ -4774,7 +4814,7 @@ function contCarteraPorCliente(moneda){
     const c = entrada(e.cliente);
     c.saldo += e.valorEnvio;
     c.saldoEnvios += e.valorEnvio;
-    c.envios.push({ codigo: e.codigo, fecha: contFechaEnvio(e), valor: e.valorEnvio, pesoLb: e.pesoLb, tipoEnvio: e.tipoEnvio, dias: contDiasDesde(contFechaEnvio(e)) });
+    c.envios.push({ codigo: e.codigo, fecha: contFechaEnvio(e), valor: e.valorEnvio, pesoLb: e.pesoLb, tipoEnvio: e.tipoEnvio, trayecto: e.trayectoEspecialUsd || 0, dias: contDiasDesde(contFechaEnvio(e)) });
   });
   return Object.values(mapa).map(c=>{
     c.facturas.sort((a,b)=> b.dias - a.dias);
@@ -4850,7 +4890,7 @@ function renderContCartera(){
                 ${c.envios.map(e=>`<tr>
                   <td style="font-family:var(--mono); font-weight:700;">${esc(e.codigo)}</td>
                   <td>${fmtFechaCorta(e.fecha)}</td>
-                  <td>${e.pesoLb} lb · ${esc(TARIFAS_ENVIO[e.tipoEnvio]?.label || e.tipoEnvio || '—')}</td>
+                  <td>${e.pesoLb} lb · ${esc(TARIFAS_ENVIO[e.tipoEnvio]?.label || e.tipoEnvio || '—')}${e.trayecto ? ` · trayecto especial ${fmt(e.trayecto)}` : ''}</td>
                   <td>${fmt(e.valor)}</td>
                   <td>${e.dias}</td>
                   <td><button class="btn btn-sm btn-primary cont-envio-pagado-btn" data-codigo="${esc(e.codigo)}" style="padding:4px 8px; font-size:11px;">✓ Pagado</button></td>
